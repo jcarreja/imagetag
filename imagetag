@@ -1,0 +1,120 @@
+#!/bin/bash
+# imagetag
+# dependencies: exiftool, bash
+program_name=imagetag
+cache_dir=$XDG_CACHE_HOME/$program_name
+# parse options -------------------------------------------------------
+while getopts ":t:T:" opt; do
+  case ${opt} in
+  t ) # manually passed taglist; takes predecence over -T
+    taglist=$(echo ${OPTARG} | sed 's/,/\n/g')
+  ;;
+  T ) # manually passed taglist as file
+    taglist_file=${OPTARG}
+  ;;
+  \? )
+    echo "Invalid flag: $OPTARG"
+    exit 1
+    ;;
+  : )
+    echo "Invalid option: $OPTARG requires an argument" 1>&2
+    echo "usage: $ imagetag [-t] [,-T]"
+    echo "   -t: pass taglist selection from arguments"
+    echo "   -T: pass taglist selection per file"
+    exit 1
+    ;;
+  esac
+done
+shift $((OPTIND -1))
+# check options and exit if needed ------------------------------------
+# check if taglist is manually supplied
+if [ -z ${taglist+x} ]; then
+  if [ -z ${taglist_file+x} ]; then
+    eval taglist_file=$cache_dir/taglist.txt
+    if [ ! -f $taglist_file ]; then
+      echo "$taglist_file does not exist"
+      invalid_opts=true                # does trigger after taglist 
+      exit 1                           # is assigned => use 'exit 1'
+    fi
+  fi
+  taglist=$(cat ${taglist_file})
+fi
+# deal with files either provided as argument or via stdin
+set -- ${@:-$(</dev/stdin)}
+if [[ $# == 0 ]] ; then echo "[error] no files provided"; invalid_opts=true; fi
+# test if invalid arguments (such as missing files) have occured
+if [[ ${invalid_opts} == true ]]; then
+  echo "        usage: imagetag [-t tags | -T tags_file ] filelist"
+  exit 1
+fi
+# get all tags --------------------------------------------------------
+tags_raw=$(exiftool -csv -XMP:Subject "$@" \
+          | cut -d ',' -s -f2- \
+          | tail -n +2 \
+          | sed 's/"//g' \
+          | sed 's/ //g' \
+           )
+tags_all=$(echo "${tags_raw}" \
+         | sed 's/,/\n/g' \
+         | sort \
+         | uniq \
+          )
+tags_all=(${tags_all//'\n'/ })
+# use dmenu to get list of new tags & tags that need to be removed ----
+tags_current=( )
+tags_2remove=( )
+while true; do
+  # spawn dmenu: $taglist provides already known tags as choices, 
+  #              $tags_all & $tags_current are displayed in the prompt.
+  current_tag=$(echo "$taglist" \
+              | dmenu \
+                -p "tags [$(echo ${tags_all[@]} ${tags_current[@]})] -- edit:")
+  # break the while loop if tag is "n/a" (first choice in $tags_all)
+  [ $current_tag == "n/a" ] && break
+  # now act on the provided tags.
+  if [[ ${current_tag} =~ ^- ]] ; then
+    # remove leading '-'
+    current_tag=${current_tag:1}
+    # check if any tags in $tags_current need to be removed
+    for (( i=0; i<${#tags_current[@]}; i++ )); do 
+      if [[ ${tags_current[i]} == $current_tag ]]; then
+        tags_current=( "${tags_current[@]:0:$i}" "${tags_current[@]:$((i + 1))}" )
+        i=$((i - 1))
+      fi
+    done
+    # check if any tags in $tags_all need to be removed. if so, then 
+    # a) remove from $tags_all to clean up prompt and 
+    # b) push to tags_2remove, that will act on the original file.
+    # this way we can maintain a $current_tag that stores the additional
+    # tags only, which can be appended to every file in the selection.
+    for (( i=0; i<${#tags_all[@]}; i++ )); do 
+      if [[ ${tags_all[i]} == $current_tag ]]; then
+        tags_all=( "${tags_all[@]:0:$i}" "${tags_all[@]:$((i + 1))}" )
+        i=$((i - 1))
+        tags_2remove+=( "$current_tag" )
+      fi
+    done
+  else
+    tags_current+=( "$current_tag" )
+  fi
+done
+
+# perform actual update -----------------------------------------------
+cmd_string_add=""
+cmd_string_rm=""
+for (( i=0; i<${#tags_current[@]}; i++ )); do 
+  # set the tags we are writing to (here: xmp and iptc)
+  cmd_string_rm+=" -XMP:Subject+=${tags_current[i]} -Keywords+=${tags_current[i]}"
+done
+for (( i=0; i<${#tags_2remove[@]}; i++ )); do 
+  # set the tags we are writing to (here: xmp and iptc)
+  cmd_string_add+=" -XMP:Subject-=${tags_2remove[i]} -Keywords-=${tags_2remove[i]}"
+done
+if [[ "$cmd_string_rm$cmd_string_add" != "" ]] ; then
+  exiftool -overwrite_original `# overwrite original by moving tmp file` \
+           $cmd_string_rm      `# first remove any tags (no dupes)` \
+           $cmd_string_add     `# and then put the new tags` \
+           "$@"                `# act on all files`
+fi
+# exit ----------------------------------------------------------------
+exit 0
